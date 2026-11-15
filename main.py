@@ -23,7 +23,7 @@ from sqlalchemy import (
     ForeignKey, Text, func, select, desc
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
@@ -262,10 +262,16 @@ async def require_join(update, context):
     return False
 
 # -------------------- KEYBOARDS --------------------
+def nav_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ နောက်သို့", callback_data="nav:back"),
+         InlineKeyboardButton("🏠 Main Menu", callback_data="nav:home")]
+    ])
+
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆓 Free Lobby", callback_data="lobby:FREE")],
-        [InlineKeyboardButton("💰 3K Lobby", callback_data="lobby:3K")],
+        [InlineKeyboardButton("💎 3K Lobby", callback_data="lobby:3K")],
         [InlineKeyboardButton("👑 Owner သို့ ဆက်သွယ်ရန်", url=f"tg://user?id={CREATOR_ID}")]
     ])
 
@@ -275,22 +281,31 @@ def lobby_keyboard(lobby):
         [InlineKeyboardButton("🆔 Owner In-game ID", callback_data=f"field:{lobby}:owner")],
         [InlineKeyboardButton("🏆 ဘယ်နှစ်ပွဲ ဆော့မလဲ", callback_data=f"field:{lobby}:matches")],
     ]
-    # The 3K menu has exactly four requested buttons; FREE has exactly three.
     if lobby == "3K":
         rows.append([InlineKeyboardButton("💳 ငွေပေးချေရန်", callback_data="field:3K:payment")])
+    rows.append([
+        InlineKeyboardButton("⬅️ နောက်သို့", callback_data="nav:back"),
+        InlineKeyboardButton("🏠 Main Menu", callback_data="nav:home")
+    ])
     return InlineKeyboardMarkup(rows)
 
 def payment_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("💳 KBZPay (KPay)", callback_data="paymethod:KPay")],
-        [InlineKeyboardButton("💜 WavePay", callback_data="paymethod:WavePay")]
+        [InlineKeyboardButton("💜 WavePay", callback_data="paymethod:WavePay")],
+        [InlineKeyboardButton("⬅️ နောက်သို့", callback_data="nav:back"),
+         InlineKeyboardButton("🏠 Main Menu", callback_data="nav:home")]
     ])
-
 
 # -------------------- MATCHMAKER --------------------
 async def process_queue(context, lobby):
-    """Builds matches from 8 distinct users. A player can request multiple matches."""
+    """
+    Assign each user's requested number of matches into separate 8-player
+    match rooms. Incomplete matches remain visible as Player n/8.
+    Select a random leader only when a match reaches eight players.
+    """
     completed = []
+    updated_matches = set()
     with Session() as db:
         regs = db.scalars(
             select(Registration).where(
@@ -298,113 +313,200 @@ async def process_queue(context, lobby):
                 Registration.status.in_(["queued", "partially_assigned"])
             ).order_by(Registration.created_at, Registration.id)
         ).all()
+
         remaining = {}
         for reg in regs:
-            assigned = db.scalar(select(func.count(MatchPlayer.id)).where(
-                MatchPlayer.registration_id == reg.id
-            )) or 0
+            assigned = db.scalar(
+                select(func.count(MatchPlayer.id)).where(
+                    MatchPlayer.registration_id == reg.id
+                )
+            ) or 0
             remaining[reg.id] = max(0, reg.requested_matches - assigned)
 
-        while True:
-            candidates = []
-            used_users = set()
-            for reg in regs:
-                if remaining.get(reg.id, 0) > 0 and reg.user_id not in used_users:
-                    candidates.append(reg)
-                    used_users.add(reg.user_id)
-                if len(candidates) == 8:
-                    break
-            if len(candidates) < 8:
-                break
-            leader = random.choice(candidates)
-            match = Match(lobby=lobby, leader_user_id=leader.user_id, created_at=now_utc())
-            db.add(match)
-            db.flush()
-            for reg in candidates:
-                db.add(MatchPlayer(
-                    match_id=match.id, user_id=reg.user_id, registration_id=reg.id,
-                    game_name=reg.game_name, owner_game_id=reg.owner_game_id
-                ))
-                remaining[reg.id] -= 1
-            completed.append((match.id, lobby, leader.user_id, [
-                (r.user_id, r.game_name, r.owner_game_id,
-                 r.user.first_name if r.user else "",
-                 r.user.last_name if r.user else "",
-                 r.user.username if r.user else "") for r in candidates
-            ]))
-            for reg in candidates:
-                reg.status = "completed" if remaining[reg.id] == 0 else "partially_assigned"
         for reg in regs:
-            if remaining.get(reg.id, 0) > 0 and reg.status == "queued":
-                reg.status = "partially_assigned"
+            while remaining.get(reg.id, 0) > 0:
+                open_matches = db.scalars(
+                    select(Match).where(
+                        Match.lobby == lobby,
+                        Match.status == "filling"
+                    ).order_by(Match.id)
+                ).all()
+                target = None
+                for candidate in open_matches:
+                    player_count = db.scalar(
+                        select(func.count(MatchPlayer.id)).where(
+                            MatchPlayer.match_id == candidate.id
+                        )
+                    ) or 0
+                    already_in = db.scalar(
+                        select(func.count(MatchPlayer.id)).where(
+                            MatchPlayer.match_id == candidate.id,
+                            MatchPlayer.user_id == reg.user_id
+                        )
+                    ) or 0
+                    if player_count < 8 and not already_in:
+                        target = candidate
+                        break
+
+                if target is None:
+                    target = Match(
+                        lobby=lobby, leader_user_id=reg.user_id,
+                        status="filling", created_at=now_utc()
+                    )
+                    db.add(target)
+                    db.flush()
+
+                db.add(MatchPlayer(
+                    match_id=target.id, user_id=reg.user_id,
+                    registration_id=reg.id, game_name=reg.game_name,
+                    owner_game_id=reg.owner_game_id
+                ))
+                db.flush()
+                remaining[reg.id] -= 1
+
+                player_rows = db.scalars(
+                    select(MatchPlayer).where(MatchPlayer.match_id == target.id)
+                ).all()
+                updated_matches.add(target.id)
+                if len(player_rows) == 8:
+                    leader = random.choice(player_rows)
+                    target.leader_user_id = leader.user_id
+                    target.status = "formed"
+                    details = []
+                    for player in player_rows:
+                        u = db.get(User, player.user_id)
+                        details.append((
+                            player.user_id, player.game_name, player.owner_game_id,
+                            u.first_name if u else "",
+                            u.last_name if u else "",
+                            u.username if u else ""
+                        ))
+                    completed.append((target.id, lobby, leader.user_id, details))
+
+            reg.status = "completed" if remaining.get(reg.id, 0) == 0 else "partially_assigned"
+
         db.commit()
+
+    # Keep every participant informed as each individual match fills.
+    for updated_id in sorted(updated_matches):
+        with Session() as db:
+            match = db.get(Match, updated_id)
+            if not match or match.status != "filling":
+                continue
+            player_rows = db.scalars(
+                select(MatchPlayer).where(MatchPlayer.match_id == updated_id)
+            ).all()
+            count = len(player_rows)
+            participant_ids = [row.user_id for row in player_rows]
+        progress = (
+            f"🎮 {lobby} LOBBY — MATCH ID: {updated_id}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👥 Player: {count}/8\n"
+            f"⏳ လူ {8-count} ယောက် လိုသေးသည်။\n"
+            "✅ 8 ယောက်ပြည့်သည်နှင့် Leader ကို ကျပန်းရွေးချယ်ပေးပါမည်။"
+        )
+        for participant_id in participant_ids:
+            try:
+                await context.bot.send_message(participant_id, progress)
+            except Exception:
+                log.info("Could not send match progress to %s", participant_id)
 
     for match_id, mode, leader_id, players in completed:
         leader_info = next((p for p in players if p[0] == leader_id), None)
-        lines = [f"🏆 {mode} Lobby - Match #{match_id}", "━━━━━━━━━━━━━━"]
+        lines = [
+            f"🏆 {mode} LOBBY — MATCH ID: {match_id}",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"👑 Leader: {leader_info[1] if leader_info else '—'}",
+            "━━━━━━━━━━━━━━━━━━━━"
+        ]
         for idx, (uid, game, owner_id, first_name, last_name, username) in enumerate(players, 1):
             leader_tag = " 👑 LEADER" if uid == leader_id else ""
-            lines.append(f"{idx}. {game}{leader_tag}\n   Telegram Name: {(first_name + ' ' + last_name).strip()}\n   Username: @{username or '—'}\n   Telegram ID: {uid}\n   Owner ID: {owner_id}")
+            lines.append(
+                f"{idx}. {game}{leader_tag}\n"
+                f"   👤 Telegram Name: {(first_name + ' ' + last_name).strip()}\n"
+                f"   🔗 Username: @{username or '—'}\n"
+                f"   🆔 Telegram ID: {uid}\n"
+                f"   🎮 Owner ID: {owner_id}"
+            )
         report = "\n".join(lines)
         try:
-            await context.bot.send_message(CREATOR_ID, "📣 Match ပြည့်သွားပါပြီ!\n\n" + report)
+            await context.bot.send_message(
+                CREATOR_ID, "🎉 8/8 PLAYER ပြည့်စုံသွားပါပြီ။\n\n" + report
+            )
         except Exception:
             log.exception("Creator match notification failed")
+
         for uid, game, owner_id, first_name, last_name, username in players:
             try:
                 await context.bot.send_message(
-                    uid, f"🎉 Match #{match_id} ပြည့်သွားပါပြီ!\n\n"
-                    f"👑 Leader: {leader_info[1]}\n"
-                    f"{'သင်ဟာ ဒီပွဲရဲ့ Leader ဖြစ်ပါတယ်။' if uid == leader_id else 'Leader ရဲ့ညွှန်ကြားချက်ကို လိုက်နာပေးပါ။'}"
+                    uid,
+                    f"🎉 {mode} Lobby — Match ID: {match_id}\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Player 8/8 ပြည့်စုံပါပြီ။\n"
+                    f"👑 Leader: {leader_info[1] if leader_info else '—'}\n"
+                    f"{'🎖️ သင်ဟာ ဒီပွဲရဲ့ Leader ဖြစ်ပါတယ်။' if uid == leader_id else '📢 Leader ရဲ့ညွှန်ကြားချက်ကို လိုက်နာပေးပါ။'}"
                 )
             except Exception:
                 log.info("Could not send match result to %s", uid)
 
 async def queue_status(context, user_id, lobby):
     with Session() as db:
-        pending = db.scalars(select(Registration).where(
-            Registration.user_id == user_id,
-            Registration.lobby == lobby,
-            Registration.status.in_(["queued", "partially_assigned"])
-        )).all()
-        if not pending:
+        rows = db.execute(
+            select(Match, MatchPlayer).join(
+                MatchPlayer, MatchPlayer.match_id == Match.id
+            ).where(
+                Match.lobby == lobby,
+                MatchPlayer.user_id == user_id
+            ).order_by(Match.id)
+        ).all()
+        if not rows:
             return
-        waiting = sum(max(0, r.requested_matches - (db.scalar(
-            select(func.count(MatchPlayer.id)).where(MatchPlayer.registration_id == r.id)
-        ) or 0)) for r in pending)
-        count = len({r.user_id for r in db.scalars(select(Registration).where(
-            Registration.lobby == lobby,
-            Registration.status.in_(["queued", "partially_assigned"])
-        )).all()})
+        cards = []
+        for match, _player in rows:
+            count = db.scalar(
+                select(func.count(MatchPlayer.id)).where(
+                    MatchPlayer.match_id == match.id
+                )
+            ) or 0
+            if match.status == "formed" or count >= 8:
+                status = "✅ 8/8 ပြည့်စုံပါပြီ"
+                left = 0
+            else:
+                left = 8 - count
+                status = f"⏳ Player {count}/8 — လူ {left} ယောက် လိုသေးသည်"
+            cards.append(
+                f"🎮 {lobby} LOBBY\n"
+                f"🏆 Match ID: {match.id}\n"
+                f"👥 Player: {count}/8\n"
+                f"{status}\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
     await context.bot.send_message(
         user_id,
-        f"⏳ {lobby} Lobby စာရင်းသွင်းမှု အောင်မြင်ပါတယ်။\n"
-        f"📌 သင့်အတွက် ကျန်ရှိသောပွဲ: {waiting}\n"
-        f"👥 Queue ထဲရှိ ကွဲပြားသော Player: {count}\n"
-        "8 ယောက်ပြည့်တာနဲ့ Match ကို အလိုအလျောက်ဖွဲ့ပေးပါမယ်။"
+        "📝 YZ'S BOT | စာရင်းသွင်းမှု အခြေအနေ\n"
+        f"🕒 အချိန်: {local_time(now_utc())} (မြန်မာစံတော်ချိန်)\n\n"
+        + "\n\n".join(cards)
     )
 
 # -------------------- USER FLOW --------------------
 WELCOME = (
-    "✨━━━━━━━━━━━━━━━━━━━━✨\\n"
-    "👑 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐘𝐙'𝐒 𝐁𝐎𝐓 👑\\n"
-    "✨━━━━━━━━━━━━━━━━━━━━✨\\n\\n"
-    "မင်္ဂလာပါ သူငယ်ချင်းတို့ရေ 💖\\n"
-    "YZ's Bot မှာ နွေးထွေးစွာ ကြိုဆိုပါတယ်ဗျာ။\\n\\n"
-    "🎮 *ကိုယ်တိုင်ရွေးချယ်ပြီး Lobby ဝင်ရောက်နိုင်ပါပြီ။*\\n"
-    "🆓 Free Lobby — အခမဲ့ ပါဝင်ကစားနိုင်ပါတယ်။\\n"
-    f"💎 3K Lobby — တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ဖြစ်ပါတယ်။\\n\\n"
-    "📌 ပါဝင်ကစားလိုတဲ့ Lobby ကို အောက်က Button မှာ ရွေးချယ်ပြီး "
-    "အချက်အလက်တွေ ဖြည့်သွင်းပေးပါခင်ဗျာ။\\n\\n"
-    "🏆 ပျော်ရွှင်စရာပွဲကောင်းများ ဖြစ်ပါစေ။\\n"
+    "✨━━━━━━━━━━━━━━━━━━━━✨\n"
+    "👑 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐘𝐙'𝐒 𝐁𝐎𝐓 👑\n"
+    "✨━━━━━━━━━━━━━━━━━━━━✨\n\n"
+    "မင်္ဂလာပါ သူငယ်ချင်းတို့ရေ 💖\n"
+    "YZ's Bot မှာ နွေးထွေးစွာ ကြိုဆိုပါတယ်ဗျာ။\n\n"
+    "🎮 သင့်စိတ်ကြိုက် Lobby ကို ရွေးချယ်ပြီး စာရင်းသွင်းနိုင်ပါပြီ။\n"
+    "🆓 Free Lobby — အခမဲ့ ပါဝင်ကစားနိုင်ပါတယ်။\n"
+    f"💎 3K Lobby — တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ဖြစ်ပါတယ်။\n\n"
+    "📌 ပါဝင်ကစားလိုတဲ့ Lobby ကို အောက်ပါ Menu မှာ ရွေးချယ်ပေးပါ။\n"
+    "🏆 ပွဲတစ်ပွဲစီအတွက် Player ၈ ယောက်ပြည့်သည်နှင့် Leader ကို ကျပန်းရွေးချယ်ပေးပါမယ်။\n\n"
+    "🤝 ကစားပွဲကောင်းများနှင့် အောင်မြင်မှုများ ရရှိပါစေ။\n"
     "✨━━━━━━━━━━━━━━━━━━━━✨"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     current_time = now_utc()
-    # Notify staff only for a first-time user or a genuinely returning session.
-    # This prevents repeated /start updates from flooding the creator's chat.
     notify_start = False
     with Session() as db:
         existing = db.get(User, user.id)
@@ -422,19 +524,60 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_event(db, user.id, "BOT_START", "User started the bot")
         db.commit()
     if notify_start:
-        await notify_staff(context, f"🟢 Bot အသုံးပြုသူအသစ်/ပြန်ဝင်သူ\n"
-                             f"Name: {user.full_name}\nUsername: @{user.username or '—'}\n"
-                             f"ID: {user.id}\nTime: {local_time(current_time)}")
+        await notify_staff(
+            context,
+            "🟢 [YZ BOT | USER ACTIVITY]\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 Name: {user.full_name}\n"
+            f"🔗 Username: @{user.username or '—'}\n"
+            f"🆔 User ID: {user.id}\n"
+            f"🕒 Time: {local_time(current_time)} (မြန်မာစံတော်ချိန်)"
+        )
     if not await require_join(update, context):
         return
-    await update.effective_message.reply_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
+    context.user_data.pop("awaiting", None)
+    context.user_data["_page"] = "home"
+    await update.effective_message.reply_text(
+        WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown"
+    )
+
+async def render_lobby_page(q, context, lobby):
+    title = "🆓 FREE LOBBY" if lobby == "FREE" else "💎 3K LOBBY"
+    context.user_data["_page"] = f"lobby:{lobby}"
+    context.user_data["_back_page"] = "home"
+    await q.edit_message_text(
+        f"{title}\n\n📝 စာရင်းသွင်းရန် အောက်ပါအချက်များကို ဖြည့်ပေးပါ။",
+        reply_markup=lobby_keyboard(lobby)
+    )
 
 async def home_callback(update, context):
     q = update.callback_query
     await q.answer()
     if not await require_join(update, context):
         return
-    await q.message.reply_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
+    context.user_data.pop("awaiting", None)
+    context.user_data["_page"] = "home"
+    await q.edit_message_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
+
+async def nav_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not await require_join(update, context):
+        return
+    action = q.data.split(":", 1)[1]
+    if action == "home":
+        context.user_data.pop("awaiting", None)
+        context.user_data["_page"] = "home"
+        await q.edit_message_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
+        return
+    back_page = context.user_data.get("_back_page", "home")
+    context.user_data.pop("awaiting", None)
+    if back_page.startswith("lobby:"):
+        lobby = back_page.split(":", 1)[1]
+        await render_lobby_page(q, context, lobby)
+    else:
+        context.user_data["_page"] = "home"
+        await q.edit_message_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def lobby_callback(update, context):
     q = update.callback_query
@@ -446,11 +589,10 @@ async def lobby_callback(update, context):
         await q.answer("Lobby အမျိုးအစား မမှန်ပါ။", show_alert=True)
         return
     context.user_data["draft"] = {"lobby": lobby}
-    # A new lobby registration must not accidentally reuse an older payment session.
     context.user_data.pop("payment_id", None)
-    title = "🆓 FREE LOBBY" if lobby == "FREE" else "💰 3K LOBBY"
-    await q.message.reply_text(f"{title}\n\nစာရင်းသွင်းရန် အောက်ပါအချက်များကို ဖြည့်ပေးပါ။",
-                               reply_markup=lobby_keyboard(lobby))
+    context.user_data.pop("awaiting", None)
+    context.user_data["_back_page"] = "home"
+    await render_lobby_page(q, context, lobby)
 
 async def field_callback(update, context):
     q = update.callback_query
@@ -463,27 +605,30 @@ async def field_callback(update, context):
         return
     draft = context.user_data.setdefault("draft", {"lobby": lobby})
     draft["lobby"] = lobby
+    context.user_data["_back_page"] = f"lobby:{lobby}"
     if field == "payment":
         if lobby != "3K":
             await q.answer("ဒီလုပ်ဆောင်ချက်ကို 3K Lobby မှာသာ အသုံးပြုနိုင်ပါတယ်။", show_alert=True)
             return
-        await q.message.reply_text(
-            "💳 *ငွေပေးချေမှု နည်းလမ်းရွေးချယ်ရန်*\\n\\n"
-            f"💎 တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ကျသင့်ပါမယ်။\\n"
+        context.user_data["_page"] = "payment_methods"
+        await q.edit_message_text(
+            "💳 ငွေပေးချေမှု နည်းလမ်းရွေးချယ်ရန်\n\n"
+            f"💎 တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ကျသင့်ပါမယ်။\n"
             "🏦 အောက်ပါ Payment နည်းလမ်း ၂ မျိုးထဲမှ တစ်ခုကို ရွေးချယ်ပါ။",
-            reply_markup=payment_keyboard(), parse_mode="Markdown"
+            reply_markup=payment_keyboard()
         )
         return
     if field not in ("game", "owner", "matches"):
         await q.answer("လုပ်ဆောင်ချက် မမှန်ပါ။", show_alert=True)
         return
     context.user_data["awaiting"] = field
+    context.user_data["_page"] = f"input:{field}"
     prompts = {
-        "game": "🎮 *MCGG In-game Name ထည့်သွင်းရန်*\\nသင့်ရဲ့ Game Name ကို စာသားအဖြစ် ပို့ပေးပါ။",
-        "owner": f"🆔 *Owner In-game ID ထည့်သွင်းရန်*\\nကျေးဇူးပြု၍ Owner Game ID ကို အတိအကျ ပို့ပေးပါ။\\n\\n🔐 Owner ID: `{OWNER_GAME_ID}`",
-        "matches": "🏆 *ကစားမည့်ပွဲအရေအတွက်*\\nဥပမာ `2` သို့မဟုတ် `3` လို့ ပို့ပေးပါ။\\n💡 3K Lobby အတွက် တစ်ပွဲလျှင် 3,000 MMK ကျသင့်ပါတယ်။"
+        "game": "🎮 MCGG In-game Name ထည့်သွင်းရန်\nသင့်ရဲ့ Game Name ကို စာသားအဖြစ် ပို့ပေးပါ။",
+        "owner": f"🆔 Owner In-game ID ထည့်သွင်းရန်\nကျေးဇူးပြု၍ Owner Game ID ကို အတိအကျ ပို့ပေးပါ။\n\n🔐 Owner ID: {OWNER_GAME_ID}",
+        "matches": "🏆 ကစားမည့်ပွဲအရေအတွက်\nဥပမာ 2 သို့မဟုတ် 3 လို့ ပို့ပေးပါ။"
     }
-    await q.message.reply_text(prompts[field], parse_mode="Markdown")
+    await q.edit_message_text(prompts[field], reply_markup=nav_keyboard())
 
 async def finalize_draft(update, context):
     user = update.effective_user
@@ -515,7 +660,7 @@ async def finalize_draft(update, context):
     else:
         return False
     context.user_data.pop("awaiting", None)
-    await update.effective_message.reply_text("✅ အချက်အလက်ကို လက်ခံသိမ်းဆည်းပြီးပါပြီ။ ကျန်အချက်အလက်များကို ဆက်လက်ဖြည့်ပေးပါ။")
+    await update.effective_message.reply_text("✅ အချက်အလက်ကို လက်ခံသိမ်းဆည်းပြီးပါပြီ။ ကျန်အချက်အလက်များကို ဆက်လက်ဖြည့်ပေးပါ။", reply_markup=nav_keyboard())
     if all(k in draft for k in ("game_name", "owner_game_id", "matches")):
         with Session() as db:
             u = get_user(db, user)
@@ -543,7 +688,14 @@ async def finalize_draft(update, context):
                 log_event(db, user.id, "FREE_REGISTERED", f"registration={reg.id}, matches={draft['matches']}")
                 db.commit()
                 context.user_data.pop("draft", None)
-                await update.effective_message.reply_text("🎉 🆓 FREE Lobby စာရင်းသွင်းမှု အောင်မြင်ပါပြီ။ 8 ယောက်ပြည့်ပါက Match ကို အလိုအလျောက်ဖွဲ့ပေးပါမယ်။")
+                await update.effective_message.reply_text(
+                    "📝 YZ'S BOT | FREE LOBBY စာရင်းသွင်းမှု အောင်မြင်ပါပြီ။\n"
+                    "━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🎮 Game Name: {draft['game_name']}\n"
+                    f"🏆 ကစားမည့်ပွဲ: {draft['matches']} ပွဲ\n"
+                    f"🕒 အချိန်: {local_time(now_utc())} (မြန်မာစံတော်ချိန်)\n\n"
+                    "👥 ပွဲတစ်ပွဲစီတွင် Player ၈ ယောက်ပြည့်သည်နှင့် အလိုအလျောက် အတည်ပြုပေးပါမယ်။"
+                )
                 await process_queue(context, "FREE")
                 await queue_status(context, user.id, "FREE")
             else:
@@ -560,20 +712,20 @@ async def finalize_draft(update, context):
                 context.user_data["payment_id"] = payment.id
                 context.user_data.pop("draft", None)
                 summary = (
-                    "💎 *3K LOBBY စာရင်းသွင်းမှု*\\n"
-                    "━━━━━━━━━━━━━━━━━━\\n"
-                    f"🎮 ကစားမည့်ပွဲ: {draft['matches']} ပွဲ\\n"
-                    f"💵 တစ်ပွဲနှုန်း: {MATCH_FEE:,} MMK\\n"
-                    f"🧾 စုစုပေါင်းကျသင့်ငွေ: *{amount:,} MMK*\\n"
-                    "━━━━━━━━━━━━━━━━━━\\n\\n"
+                    "💎 *3K LOBBY စာရင်းသွင်းမှု*\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"🎮 ကစားမည့်ပွဲ: {draft['matches']} ပွဲ\n"
+                    f"💵 တစ်ပွဲနှုန်း: {MATCH_FEE:,} MMK\n"
+                    f"🧾 စုစုပေါင်းကျသင့်ငွေ: *{amount:,} MMK*\n"
+                    "━━━━━━━━━━━━━━━━━━\n\n"
                 )
                 if selected_method:
                     if selected_method == "KPay":
-                        pay_details = f"💳 *KPay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{K_PAY_NUMBER}`\\n👤 အမည်: *{K_PAY_NAME}*"
+                        pay_details = f"💳 *KPay ငွေလွှဲရန်*\n📱 နံပါတ်: `{K_PAY_NUMBER}`\n👤 အမည်: *{K_PAY_NAME}*"
                     else:
-                        pay_details = f"💜 *WavePay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{WAVE_NUMBER}`\\n👤 အမည်: *{WAVE_NAME}*"
+                        pay_details = f"💜 *WavePay ငွေလွှဲရန်*\n📱 နံပါတ်: `{WAVE_NUMBER}`\n👤 အမည်: *{WAVE_NAME}*"
                     await update.effective_message.reply_text(
-                        summary + pay_details + "\\n\\n🧾 ငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။",
+                        summary + pay_details + "\n\n🧾 ငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။",
                         parse_mode="Markdown"
                     )
                 else:
@@ -600,10 +752,11 @@ async def payment_method_callback(update, context):
             await q.message.reply_text("⚠️ 3K Lobby စာရင်းသွင်းမှုကို အရင်စတင်ပေးပါ။")
             return
         draft["payment_method"] = method
-        await q.message.reply_text(
-            f"✅ {method} ကို ရွေးချယ်ပြီးပါပြီ။\\n"
+        await q.edit_message_text(
+            f"✅ {method} ကို ရွေးချယ်ပြီးပါပြီ။\n"
             "📝 ကျန်ရှိနေသေးတဲ့ Game Name၊ Owner ID နဲ့ ပွဲအရေအတွက်ကို ဖြည့်သွင်းပြီးပါက "
-            "ငွေလွှဲရန် အချက်အလက်ကို ပြပေးပါမယ်။"
+            "ငွေလွှဲရန် အချက်အလက်ကို ပြပေးပါမယ်။",
+            reply_markup=nav_keyboard()
         )
         return
 
@@ -616,11 +769,11 @@ async def payment_method_callback(update, context):
         amount = p.amount
         db.commit()
     if method == "KPay":
-        details = f"💳 *KPay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{K_PAY_NUMBER}`\\n👤 အမည်: *{K_PAY_NAME}*"
+        details = f"💳 *KPay ငွေလွှဲရန်*\n📱 နံပါတ်: `{K_PAY_NUMBER}`\n👤 အမည်: *{K_PAY_NAME}*"
     else:
-        details = f"💜 *WavePay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{WAVE_NUMBER}`\\n👤 အမည်: *{WAVE_NAME}*"
+        details = f"💜 *WavePay ငွေလွှဲရန်*\n📱 နံပါတ်: `{WAVE_NUMBER}`\n👤 အမည်: *{WAVE_NAME}*"
     await q.message.reply_text(
-        f"{details}\\n\\n🧾 ပေးချေရမည့်ငွေ: *{amount:,} MMK*\\n"
+        f"{details}\n\n🧾 ပေးချေရမည့်ငွေ: *{amount:,} MMK*\n"
         "📸 ငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။",
         parse_mode="Markdown"
     )
@@ -648,11 +801,16 @@ async def receipt_handler(update, context):
         p.status = "pending_review"
         log_event(db, user.id, "PAYMENT_RECEIPT_SENT", f"payment={p.id}, method={p.method}, amount={p.amount}")
         db.commit()
-        details = (f"🧾 Payment စစ်ဆေးရန် #{p.id}\n"
-                   f"Name: {user.full_name}\nUsername: @{user.username or '—'}\n"
-                   f"Telegram ID: {user.id}\nAmount: {p.amount:,} MMK\nMethod: {p.method}\n"
-                   f"Time: {local_time(now_utc())}")
-    await msg.reply_text("✅ ပြေစာကို လက်ခံရရှိပါပြီ။ Admin စစ်ဆေးပြီးမှ စာရင်းဝင်ပါမယ်။")
+        details = (f"🧾 YZ BOT | PAYMENT REVIEW #{p.id}\n"
+                   f"👤 Name: {user.full_name}\nUsername: @{user.username or '—'}\n"
+                   f"🆔 Telegram ID: {user.id}\n🎮 Game Name: {p.registration.game_name}\n"
+                   f"🏆 Matches: {p.registration.requested_matches}\n"
+                   f"💵 Amount: {p.amount:,} MMK\n💳 Method: {p.method}\n"
+                   f"🕒 Time: {local_time(now_utc())} (Myanmar Time)")
+    await msg.reply_text(
+        "🧾 ငွေလွှဲပြေစာအား Creator ထံ ပေးပို့ပြီးပါပြီ။\n\n"
+        "⏳ Creator မှ ပြေစာအား အတည်ပြုပြီးလျှင် 3K Lobby အတွက် Auto စာရင်းသွင်းပေးသွားပါမည်။"
+    )
     targets = {CREATOR_ID}
     with Session() as db:
         targets.update(a.id for a in db.scalars(select(Admin)).all()
@@ -687,7 +845,15 @@ async def payment_review_callback(update, context):
             reg.status = "queued"
             log_event(db, p.user_id, "PAYMENT_APPROVED", f"payment={pid}, amount={p.amount}")
             user_id, lobby = p.user_id, reg.lobby
-            response = "✅ Payment လက်ခံပြီးပါပြီ။ သင့်စာရင်းကို Lobby Queue ထဲ ထည့်သွင်းလိုက်ပါပြီ။"
+            response = (
+                "📝 YZ'S BOT | 3K LOBBY စာရင်းသွင်းမှု အတည်ပြုပြီးပါပြီ။\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎮 Game Name: {reg.game_name}\n"
+                f"🏆 ကစားမည့်ပွဲ: {reg.requested_matches} ပွဲ\n"
+                f"💵 ပေးချေငွေ: {p.amount:,} MMK\n"
+                f"🕒 အချိန်: {local_time(now_utc())} (မြန်မာစံတော်ချိန်)\n\n"
+                "👥 Lobby Queue ထဲသို့ Auto စာရင်းသွင်းပြီးပါပြီ။"
+            )
         else:
             p.status = "rejected"
             reg.status = "rejected"
@@ -1008,6 +1174,19 @@ def create_excel_backup():
     wb.save(filename)
     if not os.path.exists(filename) or os.path.getsize(filename) < 100:
         raise RuntimeError("Excel backup verification failed")
+
+    # Re-open the generated workbook to ensure it is a readable Excel file
+    # before /restart is allowed to continue.
+    check_wb = load_workbook(filename, read_only=True, data_only=True)
+    try:
+        expected_sheets = [name for name, _model in tables]
+        if check_wb.sheetnames != expected_sheets:
+            raise RuntimeError("Excel backup is missing one or more database sheets")
+        for check_ws in check_wb.worksheets:
+            if check_ws.max_row < 1:
+                raise RuntimeError(f"Excel backup sheet is empty: {check_ws.title}")
+    finally:
+        check_wb.close()
     return filename
 
 async def backup_command(update, context):
@@ -1030,7 +1209,7 @@ async def restart_command(update, context):
                                             caption="✅ Restart မတိုင်မီ မဖြစ်မနေ Backup")
         await update.effective_message.reply_text("✅ Excel Backup အောင်မြင်ပါပြီ။ Bot ကို ပြန်စတင်နေပါပြီ။")
         await asyncio.sleep(2)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
     except Exception as exc:
         log.exception("Protected restart failed")
         await update.effective_message.reply_text(f"❌ Backup မအောင်မြင်သဖြင့် Restart မလုပ်ပါ။\n{str(exc)[:500]}")
@@ -1175,6 +1354,7 @@ def main():
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CallbackQueryHandler(verify_join_callback, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^home$"))
+    app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav:"))
     app.add_handler(CallbackQueryHandler(lobby_callback, pattern=r"^lobby:"))
     app.add_handler(CallbackQueryHandler(field_callback, pattern=r"^field:"))
     app.add_handler(CallbackQueryHandler(payment_method_callback, pattern=r"^paymethod:"))
