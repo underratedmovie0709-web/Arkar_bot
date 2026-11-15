@@ -389,13 +389,29 @@ WELCOME = (
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    current_time = now_utc()
+    # Notify staff only for a first-time user or a genuinely returning session.
+    # This prevents repeated /start updates from flooding the creator's chat.
+    notify_start = False
     with Session() as db:
-        u = get_user(db, user)
+        existing = db.get(User, user.id)
+        if existing is None:
+            notify_start = True
+        else:
+            previous_seen = existing.last_seen or existing.first_seen
+            if previous_seen:
+                if previous_seen.tzinfo is None:
+                    previous_seen = previous_seen.replace(tzinfo=timezone.utc)
+                notify_start = (current_time - previous_seen).total_seconds() >= 6 * 60 * 60
+            else:
+                notify_start = True
+        get_user(db, user)
         log_event(db, user.id, "BOT_START", "User started the bot")
         db.commit()
-    await notify_staff(context, f"🟢 Bot အသုံးပြုသူအသစ်/ပြန်ဝင်သူ\n"
-                         f"Name: {user.full_name}\nUsername: @{user.username or '—'}\n"
-                         f"ID: {user.id}\nTime: {local_time(now_utc())}")
+    if notify_start:
+        await notify_staff(context, f"🟢 Bot အသုံးပြုသူအသစ်/ပြန်ဝင်သူ\n"
+                             f"Name: {user.full_name}\nUsername: @{user.username or '—'}\n"
+                             f"ID: {user.id}\nTime: {local_time(current_time)}")
     if not await require_join(update, context):
         return
     await update.effective_message.reply_text(WELCOME, reply_markup=main_keyboard())
@@ -973,13 +989,34 @@ async def my_chat_member_update(update, context):
     if not cm:
         return
     user_id = cm.chat.id
-    status = cm.new_chat_member.status
+    old_status = cm.old_chat_member.status
+    new_status = cm.new_chat_member.status
+
+    # Only private-chat block/unblock transitions are relevant here.
+    if new_status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        event_name = "BOT_BLOCKED"
+        new_bot_status = "blocked"
+    elif new_status == ChatMemberStatus.MEMBER:
+        event_name = "BOT_UNBLOCKED"
+        new_bot_status = "active"
+    else:
+        return
+
     with Session() as db:
         u = db.get(User, user_id)
         if u:
-            u.bot_status = "blocked" if status == ChatMemberStatus.KICKED else "active"
-            event_name = "BOT_BLOCKED" if status == ChatMemberStatus.KICKED else "BOT_UNBLOCKED"
+            # Ignore duplicate Telegram membership updates.
+            if u.bot_status == new_bot_status:
+                return
+            u.bot_status = new_bot_status
             log_event(db, user_id, event_name)
+            db.commit()
+        else:
+            # Do not reference an event variable conditionally; the transition
+            # is valid even if the user has not yet sent /start to this bot.
+            db.add(Activity(user_id=user_id, event=event_name,
+                            details="Telegram private-chat membership update",
+                            created_at=now_utc()))
             db.commit()
     await notify_staff(context, f"🔔 Bot {event_name}: Telegram User ID {user_id} | Time: {local_time(now_utc())}")
 
