@@ -1198,21 +1198,90 @@ async def backup_command(update, context):
         await update.effective_message.reply_document(f, filename=os.path.basename(path), caption="📦 Database Backup (Myanmar Time)")
 
 async def restart_command(update, context):
-    if update.effective_user.id != CREATOR_ID:
-        await update.effective_message.reply_text("⛔ Creator တစ်ဦးတည်းသာ Restart လုပ်နိုင်ပါတယ်။"); return
-    await update.effective_message.reply_text("📦 Excel Backup ပြုလုပ်နေပါတယ်။ Backup မအောင်မြင်ပါက Restart မလုပ်ပါ။")
+    """Creator-only factory reset: confirm, deliver a verified backup, then clear bot tables."""
+    if not update.effective_user or update.effective_user.id != CREATOR_ID:
+        await update.effective_message.reply_text("⛔ Creator တစ်ဦးတည်းသာ Database Reset လုပ်နိုင်ပါတယ်။")
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Backup ပြီး အကုန်ရှင်းမယ်", callback_data="factory_reset:confirm")],
+        [InlineKeyboardButton("❌ မလုပ်တော့ပါ", callback_data="factory_reset:cancel")],
+    ])
+    await update.effective_message.reply_text(
+        "⚠️ DATABASE FACTORY RESET\n\n"
+        "ဒီလုပ်ဆောင်ချက်က Bot ရဲ့ Database ထဲရှိ User, Admin, Lobby, Match, "
+        "Registration, Payment, Receipt မှတ်တမ်း, Expense နဲ့ Activity မှတ်တမ်း "
+        "အားလုံးကို အပြီးတိုင်ရှင်းလင်းပါမယ်။\n\n"
+        "📦 အရင်ဆုံး Excel Backup ကို Creator ထံ ပို့ပါမယ်။ Backup ပို့တာ မအောင်မြင်ရင် "
+        "Database ကို လုံးဝမရှင်းပါ။\n\n"
+        "သေချာမှသာ အောက်က Confirm ကိုနှိပ်ပါ။",
+        reply_markup=keyboard,
+    )
+
+async def factory_reset_callback(update, context):
+    query = update.callback_query
+    if not query:
+        return
+    if not query.from_user or query.from_user.id != CREATOR_ID:
+        await query.answer("Creator တစ်ဦးတည်းသာ လုပ်ဆောင်နိုင်ပါတယ်။", show_alert=True)
+        return
+
+    action = (query.data or "").split(":", 1)[-1]
+    if action == "cancel":
+        await query.answer("ဖျက်သိမ်းပြီးပါပြီ။")
+        await query.edit_message_text("❎ Database Reset ကို ဖျက်သိမ်းလိုက်ပါပြီ။ Data များ မပြောင်းလဲပါ။")
+        return
+    if action != "confirm":
+        await query.answer("မသိရှိသော လုပ်ဆောင်ချက်ပါ။", show_alert=True)
+        return
+
+    await query.answer("Backup ပြုလုပ်နေပါတယ်…")
+    await query.edit_message_text(
+        "📦 Database Backup ပြုလုပ်နေပါတယ်။\n"
+        "Backup ဖိုင် Creator ထံ အောင်မြင်စွာ မပို့နိုင်ပါက Database ကို မရှင်းပါ။"
+    )
     try:
+        # 1) Create and validate a complete workbook before touching database data.
         path = create_excel_backup()
-        # Deliver and wait for Telegram to accept the file before restarting.
+
+        # 2) Send the backup to the Creator. Continue only after Telegram accepts it.
         with open(path, "rb") as f:
-            await context.bot.send_document(CREATOR_ID, f, filename=os.path.basename(path),
-                                            caption="✅ Restart မတိုင်မီ မဖြစ်မနေ Backup")
-        await update.effective_message.reply_text("✅ Excel Backup အောင်မြင်ပါပြီ။ Bot ကို ပြန်စတင်နေပါပြီ။")
-        await asyncio.sleep(2)
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+            await context.bot.send_document(
+                chat_id=CREATOR_ID,
+                document=f,
+                filename=os.path.basename(path),
+                caption=(
+                    "📦 YZ BOT | FULL DATABASE BACKUP\n"
+                    "✅ Database Reset မလုပ်မီ Backup ဖိုင်\n"
+                    "🕒 " + local_time(now_utc())
+                ),
+            )
+
+        # 3) Drop and recreate only this bot's SQLAlchemy-managed tables.
+        #    This clears every bot record and resets auto-increment sequences.
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+
+        await query.edit_message_text(
+            "✅ DATABASE FACTORY RESET အောင်မြင်ပါပြီ။\n\n"
+            "📦 Backup ဖိုင်ကို Creator ထံ အရင်ပို့ပြီးပါပြီ။\n"
+            "🗑️ Bot Database ထဲက အချက်အလက်အားလုံးကို ရှင်းလင်းပြီးပါပြီ။\n"
+            "🔄 Database အသစ်အတိုင်း ပြန်စတင်အသုံးပြုနိုင်ပါပြီ။"
+        )
+        log.warning("Creator completed full bot database factory reset")
     except Exception as exc:
-        log.exception("Protected restart failed")
-        await update.effective_message.reply_text(f"❌ Backup မအောင်မြင်သဖြင့် Restart မလုပ်ပါ။\n{str(exc)[:500]}")
+        log.exception("Factory reset failed")
+        try:
+            await query.edit_message_text(
+                "❌ Database Reset မအောင်မြင်ပါ။\n"
+                "Backup ပို့ခြင်း မအောင်မြင်ခဲ့ပါက Database ကို မရှင်းထားပါ။\n"
+                f"အသေးစိတ်: {str(exc)[:400]}"
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=CREATOR_ID,
+                text=f"❌ Database Reset မအောင်မြင်ပါ။ အသေးစိတ်: {str(exc)[:400]}"
+            )
 
 # -------------------- CHANNEL MEMBER EVENTS --------------------
 async def channel_member_update(update, context):
@@ -1352,6 +1421,7 @@ def main():
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("expense", expense_command))
     app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CallbackQueryHandler(factory_reset_callback, pattern=r"^factory_reset:"))
     app.add_handler(CallbackQueryHandler(verify_join_callback, pattern=r"^verify_join$"))
     app.add_handler(CallbackQueryHandler(home_callback, pattern=r"^home$"))
     app.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav:"))
