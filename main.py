@@ -270,18 +270,22 @@ def main_keyboard():
     ])
 
 def lobby_keyboard(lobby):
-    return InlineKeyboardMarkup([
+    rows = [
         [InlineKeyboardButton("🎮 MCGG In-game Name", callback_data=f"field:{lobby}:game")],
         [InlineKeyboardButton("🆔 Owner In-game ID", callback_data=f"field:{lobby}:owner")],
         [InlineKeyboardButton("🏆 ဘယ်နှစ်ပွဲ ဆော့မလဲ", callback_data=f"field:{lobby}:matches")],
-        [InlineKeyboardButton("⬅️ Main Menu", callback_data="home")]
-    ])
+    ]
+    # The 3K menu has exactly four requested buttons; FREE has exactly three.
+    if lobby == "3K":
+        rows.append([InlineKeyboardButton("💳 ငွေပေးချေရန်", callback_data="field:3K:payment")])
+    return InlineKeyboardMarkup(rows)
 
 def payment_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 KPay", callback_data="paymethod:KPay")],
+        [InlineKeyboardButton("💳 KBZPay (KPay)", callback_data="paymethod:KPay")],
         [InlineKeyboardButton("💜 WavePay", callback_data="paymethod:WavePay")]
     ])
+
 
 # -------------------- MATCHMAKER --------------------
 async def process_queue(context, lobby):
@@ -382,9 +386,18 @@ async def queue_status(context, user_id, lobby):
 
 # -------------------- USER FLOW --------------------
 WELCOME = (
-    "မင်္ဂလာပါ သူငယ်ချင်းတို့ YZ's Bot မှာ ကြိုဆိုလိုက်ပါတယ်ဗျ။\n"
-    "Custom ကြေးပွဲ ဆော့ချင်သူများ ၊ အခမဲ့ ဆော့ချင်သူများ အနေဖြင့် "
-    "အောက်ပါတို့မှ သက်ဆိုင်ရာ Button များတွင် စာရင်း ပေးသွင်းနိုင်ပါတယ် ခင်ဗျာ။"
+    "✨━━━━━━━━━━━━━━━━━━━━✨\\n"
+    "👑 𝐖𝐄𝐋𝐂𝐎𝐌𝐄 𝐓𝐎 𝐘𝐙'𝐒 𝐁𝐎𝐓 👑\\n"
+    "✨━━━━━━━━━━━━━━━━━━━━✨\\n\\n"
+    "မင်္ဂလာပါ သူငယ်ချင်းတို့ရေ 💖\\n"
+    "YZ's Bot မှာ နွေးထွေးစွာ ကြိုဆိုပါတယ်ဗျာ။\\n\\n"
+    "🎮 *ကိုယ်တိုင်ရွေးချယ်ပြီး Lobby ဝင်ရောက်နိုင်ပါပြီ။*\\n"
+    "🆓 Free Lobby — အခမဲ့ ပါဝင်ကစားနိုင်ပါတယ်။\\n"
+    f"💎 3K Lobby — တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ဖြစ်ပါတယ်။\\n\\n"
+    "📌 ပါဝင်ကစားလိုတဲ့ Lobby ကို အောက်က Button မှာ ရွေးချယ်ပြီး "
+    "အချက်အလက်တွေ ဖြည့်သွင်းပေးပါခင်ဗျာ။\\n\\n"
+    "🏆 ပျော်ရွှင်စရာပွဲကောင်းများ ဖြစ်ပါစေ။\\n"
+    "✨━━━━━━━━━━━━━━━━━━━━✨"
 )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -414,14 +427,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              f"ID: {user.id}\nTime: {local_time(current_time)}")
     if not await require_join(update, context):
         return
-    await update.effective_message.reply_text(WELCOME, reply_markup=main_keyboard())
+    await update.effective_message.reply_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def home_callback(update, context):
     q = update.callback_query
     await q.answer()
     if not await require_join(update, context):
         return
-    await q.message.reply_text(WELCOME, reply_markup=main_keyboard())
+    await q.message.reply_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
 
 async def lobby_callback(update, context):
     q = update.callback_query
@@ -429,7 +442,12 @@ async def lobby_callback(update, context):
     if not await require_join(update, context):
         return
     lobby = q.data.split(":")[1]
+    if lobby not in ("FREE", "3K"):
+        await q.answer("Lobby အမျိုးအစား မမှန်ပါ။", show_alert=True)
+        return
     context.user_data["draft"] = {"lobby": lobby}
+    # A new lobby registration must not accidentally reuse an older payment session.
+    context.user_data.pop("payment_id", None)
     title = "🆓 FREE LOBBY" if lobby == "FREE" else "💰 3K LOBBY"
     await q.message.reply_text(f"{title}\n\nစာရင်းသွင်းရန် အောက်ပါအချက်များကို ဖြည့်ပေးပါ။",
                                reply_markup=lobby_keyboard(lobby))
@@ -440,15 +458,32 @@ async def field_callback(update, context):
     if not await require_join(update, context):
         return
     _, lobby, field = q.data.split(":")
+    if lobby not in ("FREE", "3K"):
+        await q.answer("Lobby အမျိုးအစား မမှန်ပါ။", show_alert=True)
+        return
     draft = context.user_data.setdefault("draft", {"lobby": lobby})
     draft["lobby"] = lobby
+    if field == "payment":
+        if lobby != "3K":
+            await q.answer("ဒီလုပ်ဆောင်ချက်ကို 3K Lobby မှာသာ အသုံးပြုနိုင်ပါတယ်။", show_alert=True)
+            return
+        await q.message.reply_text(
+            "💳 *ငွေပေးချေမှု နည်းလမ်းရွေးချယ်ရန်*\\n\\n"
+            f"💎 တစ်ပွဲလျှင် {MATCH_FEE:,} MMK ကျသင့်ပါမယ်။\\n"
+            "🏦 အောက်ပါ Payment နည်းလမ်း ၂ မျိုးထဲမှ တစ်ခုကို ရွေးချယ်ပါ။",
+            reply_markup=payment_keyboard(), parse_mode="Markdown"
+        )
+        return
+    if field not in ("game", "owner", "matches"):
+        await q.answer("လုပ်ဆောင်ချက် မမှန်ပါ။", show_alert=True)
+        return
     context.user_data["awaiting"] = field
     prompts = {
-        "game": "🎮 ကျေးဇူးပြု၍ သင့်ရဲ့ MCGG In-game Name ကို ပို့ပေးပါ။",
-        "owner": f"🆔 ကျေးဇူးပြု၍ Owner In-game ID ကို ပို့ပေးပါ။\n\nမှန်ကန်သော ID: {OWNER_GAME_ID}",
-        "matches": "🏆 ဘယ်နှစ်ပွဲ ဆော့ချင်ပါသလဲ။ ဥပမာ - 2 သို့မဟုတ် 3 လို့ ပို့ပေးပါ။"
+        "game": "🎮 *MCGG In-game Name ထည့်သွင်းရန်*\\nသင့်ရဲ့ Game Name ကို စာသားအဖြစ် ပို့ပေးပါ။",
+        "owner": f"🆔 *Owner In-game ID ထည့်သွင်းရန်*\\nကျေးဇူးပြု၍ Owner Game ID ကို အတိအကျ ပို့ပေးပါ။\\n\\n🔐 Owner ID: `{OWNER_GAME_ID}`",
+        "matches": "🏆 *ကစားမည့်ပွဲအရေအတွက်*\\nဥပမာ `2` သို့မဟုတ် `3` လို့ ပို့ပေးပါ။\\n💡 3K Lobby အတွက် တစ်ပွဲလျှင် 3,000 MMK ကျသင့်ပါတယ်။"
     }
-    await q.message.reply_text(prompts[field])
+    await q.message.reply_text(prompts[field], parse_mode="Markdown")
 
 async def finalize_draft(update, context):
     user = update.effective_user
@@ -480,7 +515,7 @@ async def finalize_draft(update, context):
     else:
         return False
     context.user_data.pop("awaiting", None)
-    await update.effective_message.reply_text("✅ အချက်အလက် သိမ်းဆည်းပြီးပါပြီ။")
+    await update.effective_message.reply_text("✅ အချက်အလက်ကို လက်ခံသိမ်းဆည်းပြီးပါပြီ။ ကျန်အချက်အလက်များကို ဆက်လက်ဖြည့်ပေးပါ။")
     if all(k in draft for k in ("game_name", "owner_game_id", "matches")):
         with Session() as db:
             u = get_user(db, user)
@@ -508,13 +543,15 @@ async def finalize_draft(update, context):
                 log_event(db, user.id, "FREE_REGISTERED", f"registration={reg.id}, matches={draft['matches']}")
                 db.commit()
                 context.user_data.pop("draft", None)
-                await update.effective_message.reply_text("🆓 FREE Lobby စာရင်းသွင်းမှု အောင်မြင်ပါပြီ။")
+                await update.effective_message.reply_text("🎉 🆓 FREE Lobby စာရင်းသွင်းမှု အောင်မြင်ပါပြီ။ 8 ယောက်ပြည့်ပါက Match ကို အလိုအလျောက်ဖွဲ့ပေးပါမယ်။")
                 await process_queue(context, "FREE")
                 await queue_status(context, user.id, "FREE")
             else:
                 amount = MATCH_FEE * draft["matches"]
+                selected_method = draft.get("payment_method", "")
                 payment = Payment(
                     registration_id=reg.id, user_id=user.id, amount=amount,
+                    method=selected_method,
                     status="awaiting_receipt", created_at=now_utc()
                 )
                 db.add(payment)
@@ -522,14 +559,28 @@ async def finalize_draft(update, context):
                 db.commit()
                 context.user_data["payment_id"] = payment.id
                 context.user_data.pop("draft", None)
-                await update.effective_message.reply_text(
-                    f"💰 3K Lobby စာရင်းသွင်းမှု\n\n"
-                    f"🎮 ပွဲအရေအတွက်: {draft['matches']}\n"
-                    f"💵 တစ်ပွဲ: {MATCH_FEE:,} MMK\n"
-                    f"🧾 စုစုပေါင်း: {amount:,} MMK\n\n"
-                    "ငွေပေးချေရန် နည်းလမ်းရွေးချယ်ပါ။",
-                    reply_markup=payment_keyboard()
+                summary = (
+                    "💎 *3K LOBBY စာရင်းသွင်းမှု*\\n"
+                    "━━━━━━━━━━━━━━━━━━\\n"
+                    f"🎮 ကစားမည့်ပွဲ: {draft['matches']} ပွဲ\\n"
+                    f"💵 တစ်ပွဲနှုန်း: {MATCH_FEE:,} MMK\\n"
+                    f"🧾 စုစုပေါင်းကျသင့်ငွေ: *{amount:,} MMK*\\n"
+                    "━━━━━━━━━━━━━━━━━━\\n\\n"
                 )
+                if selected_method:
+                    if selected_method == "KPay":
+                        pay_details = f"💳 *KPay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{K_PAY_NUMBER}`\\n👤 အမည်: *{K_PAY_NAME}*"
+                    else:
+                        pay_details = f"💜 *WavePay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{WAVE_NUMBER}`\\n👤 အမည်: *{WAVE_NAME}*"
+                    await update.effective_message.reply_text(
+                        summary + pay_details + "\\n\\n🧾 ငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await update.effective_message.reply_text(
+                        summary + "💳 ငွေပေးချေရန် နည်းလမ်းကို ရွေးချယ်ပေးပါ။",
+                        reply_markup=payment_keyboard(), parse_mode="Markdown"
+                    )
     return True
 
 async def payment_method_callback(update, context):
@@ -538,22 +589,41 @@ async def payment_method_callback(update, context):
     if not await require_join(update, context):
         return
     method = q.data.split(":")[1]
+    if method not in ("KPay", "WavePay"):
+        await q.answer("Payment နည်းလမ်း မမှန်ပါ။", show_alert=True)
+        return
+
     payment_id = context.user_data.get("payment_id")
     if not payment_id:
-        await q.message.reply_text("⚠️ လက်ရှိ Payment Session မတွေ့ပါ။ Lobby ကို ပြန်စတင်ပါ။")
+        draft = context.user_data.get("draft")
+        if not draft or draft.get("lobby") != "3K":
+            await q.message.reply_text("⚠️ 3K Lobby စာရင်းသွင်းမှုကို အရင်စတင်ပေးပါ။")
+            return
+        draft["payment_method"] = method
+        await q.message.reply_text(
+            f"✅ {method} ကို ရွေးချယ်ပြီးပါပြီ။\\n"
+            "📝 ကျန်ရှိနေသေးတဲ့ Game Name၊ Owner ID နဲ့ ပွဲအရေအတွက်ကို ဖြည့်သွင်းပြီးပါက "
+            "ငွေလွှဲရန် အချက်အလက်ကို ပြပေးပါမယ်။"
+        )
         return
+
     with Session() as db:
         p = db.get(Payment, payment_id)
         if not p or p.user_id != q.from_user.id or p.status != "awaiting_receipt":
             await q.message.reply_text("⚠️ Payment အခြေအနေ မမှန်ပါ။")
             return
         p.method = method
+        amount = p.amount
         db.commit()
     if method == "KPay":
-        details = f"💳 KPay\nနံပါတ်: {K_PAY_NUMBER}\nအမည်: {K_PAY_NAME}"
+        details = f"💳 *KPay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{K_PAY_NUMBER}`\\n👤 အမည်: *{K_PAY_NAME}*"
     else:
-        details = f"💜 WavePay\nနံပါတ်: {WAVE_NUMBER}\nအမည်: {WAVE_NAME}"
-    await q.message.reply_text(details + "\n\nငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။")
+        details = f"💜 *WavePay ငွေလွှဲရန်*\\n📱 နံပါတ်: `{WAVE_NUMBER}`\\n👤 အမည်: *{WAVE_NAME}*"
+    await q.message.reply_text(
+        f"{details}\\n\\n🧾 ပေးချေရမည့်ငွေ: *{amount:,} MMK*\\n"
+        "📸 ငွေလွှဲပြီးပါက ပြေစာ Screenshot ကို ဒီ Chat ထဲ ပို့ပေးပါ။",
+        parse_mode="Markdown"
+    )
 
 async def receipt_handler(update, context):
     user = update.effective_user
@@ -1024,7 +1094,7 @@ async def verify_join_callback(update, context):
     q = update.callback_query
     if await joined_channel(context.bot, q.from_user.id):
         await q.answer("✅ Channel Join ဖြစ်ကြောင်း အတည်ပြုပြီးပါပြီ။")
-        await q.message.reply_text(WELCOME, reply_markup=main_keyboard())
+        await q.message.reply_text(WELCOME, reply_markup=main_keyboard(), parse_mode="Markdown")
     else:
         await q.answer("❌ Channel Join မတွေ့သေးပါ။ Join ပြီးမှ ပြန်နှိပ်ပါ။", show_alert=True)
 
