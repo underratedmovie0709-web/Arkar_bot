@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 # -------------------- CONFIG --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CREATOR_ID = int(os.getenv("CREATOR_ID", "8946896729"))
+CREATOR_ID = 8946896729
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@magicchessgogo_YZ")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/magicchessgogo_YZ")
 OWNER_GAME_ID = os.getenv("OWNER_GAME_ID", "81230904")
@@ -272,7 +272,7 @@ def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🆓 Free Lobby", callback_data="lobby:FREE")],
         [InlineKeyboardButton("💎 3K Lobby", callback_data="lobby:3K")],
-        [InlineKeyboardButton("👑 Owner သို့ ဆက်သွယ်ရန်", url=f"tg://user?id={CREATOR_ID}")]
+        [InlineKeyboardButton("👑 Owner သို့ ဆက်သွယ်ရန်", url="https://t.me/wwwyz_yz")]
     ])
 
 def lobby_keyboard(lobby):
