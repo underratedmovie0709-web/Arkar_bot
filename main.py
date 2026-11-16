@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 # -------------------- CONFIG --------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CREATOR_ID = 8946896729
+CREATOR_ID = 8952915787
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@magicchessgogo_YZ")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/magicchessgogo_YZ")
 OWNER_GAME_ID = os.getenv("OWNER_GAME_ID", "81230904")
